@@ -1,0 +1,415 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jan 19 13:44:50 2022
+
+@author: Shadii4
+"""
+
+# Setup
+import scipy.io as spio
+import numpy as np
+import math
+import seaborn as sns
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.datasets import make_classification
+from sklearn.datasets import make_blobs
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import ShuffleSplit
+from sklearn.utils import shuffle
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neighbors import NearestNeighbors
+from sklearn.neighbors import RadiusNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.tree import DecisionTreeClassifier
+from sklearn import svm
+from sklearn.metrics import accuracy_score
+import os
+import numpy as np
+import sklearn
+import torch
+import matplotlib.pyplot as plt
+import torch.optim as optim
+from typing import Sequence
+import torch.optim
+import torch.nn as nn
+import torch.utils.data
+from torch.utils.data import TensorDataset, DataLoader
+
+torch.manual_seed(42)
+np.random.seed(42)
+#each new day we have labeled samples
+N_DAYS = 5 #number of online data records not including offline
+CR_TAU = 0.9
+global X_offline
+global y_offline
+
+##Deep netowrk class - to create: MLP(D_in=10, hidden_dims=[128,64,16], D_out=2, nonlin='relu')
+class MLP(torch.nn.Module):
+    NLS = {'relu': torch.nn.ReLU, 'tanh': nn.Tanh, 'sigmoid': nn.Sigmoid, 'softmax': nn.Softmax, 'logsoftmax': nn.LogSoftmax, 'lrelu':nn.LeakyReLU}
+
+    def __init__(self, D_in: int, hidden_dims: Sequence[int], D_out: int, nonlin='relu'):
+        super().__init__()
+        
+        all_dims = [D_in, *hidden_dims, D_out]
+        non_linearity = MLP.NLS[nonlin]
+        layers = []
+        
+        for in_dim, out_dim in zip(all_dims[:-1], all_dims[1:]):
+            layers += [
+                nn.Linear(in_dim, out_dim, bias=True),
+                non_linearity()
+            ]
+        
+        # Sequential is a container for layers
+        self.fc_layers = nn.Sequential(*layers[:-1])
+        
+        # Output non-linearity
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        x = torch.reshape(x, (x.shape[0], -1))
+        z = self.fc_layers(x)
+        y_pred = self.softmax(z)
+        # Output is always probability
+        return y_pred
+"""--------------------------------Loading Data---------------------------------------"""
+"""Loading offline data"""
+#MIFeature.mat , trainingVec.mat should in the directory file
+#if there is Excel table. use read_csv instead
+X_offline = spio.loadmat('MIFeatures_Offline.mat',squeeze_me=True)['MIFeatures']
+y_offline = spio.loadmat('trainingVec_Offline.mat',squeeze_me=True)['trainingVec']
+num_of_classes = len(np.unique(y_offline))
+num_of_trials = X_offline.shape[0]
+
+"""Loading online data"""
+num_of_records = 5
+num_of_days = N_DAYS
+X_online_array , y_online_array = [] , []
+X_online_records , y_online_records = [] , []
+
+for i in range(num_of_records):
+    data_filename = 'MIFeatures_Online' + str(i+1) + '.mat'
+    labels_filename = 'trainingVec_Online' + str(i+1) + '.mat'
+    X_online_records.append(spio.loadmat(data_filename, squeeze_me=True)['MIFeatures'])
+    y_online_records.append(spio.loadmat(labels_filename, squeeze_me=True)['trainingVec'])
+"""concatenating records at same day - change according to the specific data"""
+#Day 0 (offline)
+X_online_array.append(X_offline)
+y_online_array.append(y_offline)
+#DAY 1
+X_online_array.append(X_online_records[0])
+y_online_array.append(y_online_records[0])
+
+#DAY 2
+X_online_array.append(X_online_records[1])
+y_online_array.append(y_online_records[1])
+
+#DAY 3                      
+X_online_array.append(X_online_records[2])
+y_online_array.append(y_online_records[2])
+
+#Day 4
+X_online_array.append(np.concatenate((X_online_records[3],X_online_records[4]),axis=0))
+y_online_array.append(np.concatenate((y_online_records[3],y_online_records[4]), axis=0))
+"""-----------------------------------------------------------------------"""
+
+"""---------------------------------CLEANING DATA------------------------------"""
+X_df_array = []
+sum_r=0
+X_df_array.append(pd.DataFrame(np.concatenate((X_offline.copy(),y_offline.copy().reshape(-1,1)),axis=1)))
+for day in range(num_of_days):
+    X_df_array.append(pd.DataFrame(np.concatenate((X_online_array[day].copy(),y_online_array[day].copy().reshape(-1,1)),axis=1)))
+"""Removing Outliers"""
+for col in range(X_offline.shape[1]):
+    for day in range(num_of_days+1):
+        df_col = X_df_array[day].iloc[:,col].copy() #not sure if without the copy it is by refernce?
+        first_shape = df_col.shape[0]
+        Q1,Q3 = np.nanpercentile(sorted(df_col),[20,80])
+        IQR = Q3-Q1
+        low = Q1 - (1.5*IQR)
+        high = Q3 + (1.5*IQR)
+        df_col[df_col<low] = low - np.random.randn()
+        df_col[df_col>high] = high + np.random.randn()
+        X_df_array[day].iloc[:,col] = df_col.copy()
+        last_shape = df_col.shape[0]
+        
+        
+selected_features = [range(340)]
+X_offline = X_df_array[0][selected_features[0]].values
+for day in range(num_of_days):
+    X_online_array[day] = X_df_array[day+1][selected_features[0]].values
+
+
+## definitions
+d = X_offline.shape[1]
+batch_size=4
+n_features = X_offline[0].shape[0]
+n_classes = 3
+X_offline = X_offline[:]
+y_offline = y_offline[:]
+
+##Create train dataset
+X_train_tensor = torch.tensor(X_offline,dtype=torch.float)
+y_train_tensor = torch.tensor(y_offline)
+train_size = len(X_offline)
+
+train_dataset = TensorDataset(X_train_tensor,y_train_tensor) 
+dl_train = DataLoader(train_dataset, batch_size,
+                                       sampler=torch.utils.data.SubsetRandomSampler(range(0,train_size)))
+
+"""-------------Training function---------------"""
+    
+def train(dl_train):
+    ##train on the data set dl_train and return trained model
+    model = MLP(D_in = d,hidden_dims=[128,64],D_out=n_classes,nonlin='relu')
+    optimizer = torch.optim.SGD(params=model.parameters(), lr=0.01, weight_decay=0.001, momentum=0.4)
+    loss_fn = nn.CrossEntropyLoss()
+
+    num_epochs = 40
+    for_every = 10
+    c=0
+    for epoch_idx in range(num_epochs):
+        total_loss = 0
+        num_correct = 0
+        c+=1
+        for batch_idx, (X, y) in enumerate(dl_train):
+            # Forward pass
+            #print(X[0][:10])
+            #X = torch.zeros(X.shape)
+            y_prob = model(X)
+            # Compute loss
+            y_true = y - 1
+            #print('batch ',y_prob,y_true)
+            #print(y,y_true,y_pred)
+            loss = loss_fn(y_prob, y_true)
+            total_loss += loss.item()
+    
+            # Backward pass
+            optimizer.zero_grad() # Zero gradients of all parameters
+            loss.backward()       # Run backprop algorithms to calculate gradients
+            # Optimization step
+            optimizer.step()      # Use gradients to update model parameters
+            
+            # Calc. number of correct char predictions
+            y_pred = torch.argmax(y_prob, dim=1)
+            num_correct += torch.sum(y_pred == y_true).float()
+            
+        if c%for_every==0:    
+            print(f'Epoch #{epoch_idx+1}: Avg. loss={total_loss/len(dl_train.dataset)}, Acc={num_correct/len(dl_train.dataset)}')
+    return model
+
+#initializations
+global prm #permutation for train - test
+prm = []
+days_list = ['0','1','2','3','4']
+results_based_on_our_algorithem = np.zeros(N_DAYS)
+results_based_on_offline_clf = np.zeros(N_DAYS)
+results_based_clf_each_day = np.zeros(N_DAYS)
+
+"""-------------Naive results---------------"""
+def testNaive(model):
+    for day in range(num_of_days):
+        X_test_tensor = torch.tensor(X_online_array[day],dtype=torch.float)
+        y_test_tensor = torch.tensor(y_online_array[day])
+        with torch.no_grad():
+            y_pred = model(X_test_tensor)
+        #print(y_pred,y_true)
+        y_labels = np.argmax(y_pred,axis=1)
+        y_true = y_test_tensor - 1 
+        print(' Day '+str(day)+' Accuracy = {:0.2f}'.format(accuracy_score(y_labels,y_true)))
+        results_based_on_offline_clf[day] = accuracy_score(y_labels,y_true)
+        
+"""-------------Optimal Results---------------"""
+def testOptimal():
+    for day in range(num_of_days):
+        data_size = len(X_online_array[day])
+        train_size = int(0.75*data_size)
+        prm = np.random.permutation(data_size)
+        tr_l = prm[:train_size]
+        ts_l = prm[train_size:]
+        X_train_tensor = torch.tensor(X_online_array[day],dtype=torch.float)
+        y_train_tensor = torch.tensor(y_online_array[day])
+        
+        X_test_tensor = torch.tensor(X_online_array[day],dtype=torch.float)
+        y_test_tensor = torch.tensor(y_online_array[day])
+        
+        test_size = int(0.25*data_size)
+        #train_size = len(X_online_array[day])
+        #test_size = train_size
+        train_dataset = TensorDataset(X_train_tensor,y_train_tensor) # create your datset
+        dl_train = DataLoader(train_dataset, batch_size,
+                                               sampler=torch.utils.data.SubsetRandomSampler(range(0,train_size)))
+
+        model = train(dl_train)
+        with torch.no_grad():
+            y_pred = model(X_test_tensor)
+        #print(y_pred,y_true)
+        y_labels = np.argmax(y_pred,axis=1)
+        y_true = y_test_tensor - 1 
+        print(' Day '+str(day)+' Accuracy = {:0.2f}'.format(accuracy_score(y_labels,y_true)))
+        results_based_clf_each_day[day] = accuracy_score(y_labels,y_true)
+
+
+
+"""-------------run and show results of Naive and Optimal---------------"""
+model = train(dl_train)
+testNaive(model)
+testOptimal()
+
+figure2 , ax2 = plt.subplots()
+ax2.plot(days_list,results_based_on_our_algorithem,color='red',label='Our Algorithm')
+ax2.plot(days_list,results_based_on_offline_clf,color='blue',label='Naive Algorithm')
+ax2.set_xlabel('Days (Online)')
+ax2.set_ylabel('Accuracy')
+ax2.set_xticklabels(days_list)
+ax2.set_yticks(np.arange(0,1.1,0.1))
+ax2.legend()
+
+X_train_tensor = torch.tensor(np.concatenate((X_online_array[0],X_online_array[0])),dtype=torch.float)
+y_train_tensor = torch.tensor(np.concatenate((y_online_array[0],y_online_array[0])))
+
+X_trgt_tensor = torch.tensor(np.concatenate((X_online_array[1],X_online_array[1])),dtype=torch.float)
+y_trgt_tensor = torch.tensor(np.concatenate((y_online_array[1],y_online_array[1])))
+
+ds_source = TensorDataset(X_train_tensor,y_train_tensor) # create your datset
+ds_target = TensorDataset(X_trgt_tensor,y_trgt_tensor) # create your datset
+batch_size = 4
+# Dataloaders
+dl_source = torch.utils.data.DataLoader(ds_source, batch_size)
+dl_target = torch.utils.data.DataLoader(ds_target, batch_size)
+
+"""-------------DACNN class--------------------"""
+from torch.autograd import Function
+class GradientReversalFn(Function):
+    @staticmethod
+    def forward(ctx, x, λ):
+        # Store context for backprop
+        ctx.λ = λ
+        
+        # Forward pass is a no-op
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # grad_output is dL/dx (since our forward's output was x)
+        
+        # Backward pass is just to apply -λ to the gradient
+        # This will become the new dL/dx in the rest of the network
+        output =  - ctx.λ * grad_output
+
+        # Must return number of inputs to forward()
+        return output, None
+
+import torch.nn as nn
+
+class DACNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(d, 128),
+            nn.ReLU()
+        )
+        self.mlp_features = 128 # Assuming 28x28 input
+        
+        self.class_classifier = nn.Sequential(
+            nn.Linear(self.mlp_features, 100),
+            nn.BatchNorm1d(100), nn.Dropout2d(), nn.ReLU(True),
+            nn.Linear(100, num_of_classes),
+            nn.LogSoftmax(dim=1),
+        )
+        
+        self.domain_classifier = nn.Sequential(
+            nn.Linear(self.mlp_features, 100),
+            nn.BatchNorm1d(100), nn.ReLU(True),
+            nn.Linear(100, 2),
+            nn.LogSoftmax(dim=1),
+        )
+        
+    def forward(self, x, λ=1.0):
+        features = self.feature_extractor(x)
+        features = features.view(-1, self.mlp_features)
+        features_grl = GradientReversalFn.apply(features, λ)
+        class_pred = self.class_classifier(features)        # classify on regular features
+        domain_pred = self.domain_classifier(features_grl)  # classify on features after GRL
+        return class_pred, domain_pred
+
+days_list=['0','1','2','3','4']
+
+
+
+"""-----Our Alg----"""
+
+# Setup optimizer
+model = DACNN()
+lr = 1e-3 #carefull with this hyper-parameter
+optimizer = optim.Adam(model.parameters(), lr)
+
+# Two loss functions
+loss_fn_class = torch.nn.NLLLoss()
+loss_fn_domain = torch.nn.NLLLoss()
+max_batches = min(len(dl_source), len(dl_target)) - 1
+n_epochs = 50
+for epoch_idx in range(n_epochs):
+    print(f'Epoch {epoch_idx+1:04d} / {n_epochs:04d}', end='\n=================\n')
+    dl_source_iter = iter(dl_source)
+    dl_target_iter = iter(dl_target)
+
+    for batch_idx in range(max_batches):
+        # Calculate training progress and GRL λ
+        p = float(batch_idx + epoch_idx * max_batches) / (n_epochs * max_batches)
+        λ = 2. / (1. + np.exp(-10 * p)) - 1
+
+        # Train on source domain
+        X_s, y_s = next(dl_source_iter)
+        y_s_domain = torch.zeros(batch_size, dtype=torch.long) # generate source domain labels: 0
+        class_pred, domain_pred = model(X_s, λ)
+        y_ss = y_s - 1
+        loss_s_label = loss_fn_class(class_pred, y_ss)           # source classification loss
+        loss_s_domain = loss_fn_domain(domain_pred, y_s_domain) # source domain loss (via GRL)
+
+        # Train on target domain
+        X_t, _ = next(dl_target_iter) # Note: ignoring target domain class labels!
+        y_t_domain = torch.ones(batch_size, dtype=torch.long) # generate target domain labels: 1
+
+        _, domain_pred = model(X_t, λ)
+        loss_t_domain = loss_fn_domain(domain_pred, y_t_domain) # target domain loss (via GRL)
+        
+        # Optimize
+        loss = loss_t_domain + loss_s_domain + loss_s_label
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        print(f'[{batch_idx+1}/{max_batches}] '
+              f'class_loss: {loss_s_label.item():.4f} ' f's_domain_loss: {loss_s_domain.item():.4f} '
+              f't_domain_loss: {loss_t_domain.item():.4f} ' f'λ: {λ:.3f} '
+             )
+
+
+"""calculate results on the online data"""
+for day in range(num_of_days):            
+    X_trgt_tensor = torch.tensor(X_online_array[day],dtype=torch.float)
+    y_trgt_tensor = torch.tensor(y_online_array[day])
+    with torch.no_grad():
+        y_pred, _ = model(X_trgt_tensor, 1)
+    #print(y_pred,y_true)
+    y_labels = np.argmax(y_pred,axis=1)
+    y_true = y_trgt_tensor - 1 
+    results_based_on_our_algorithem[day] = accuracy_score(y_labels,y_true)
+
+
+
+"""--------------Show Results-------------"""
+figure2 , ax2 = plt.subplots()
+ax2.plot(days_list,results_based_clf_each_day,color='green',label='Optimal Algorithm',marker='o')
+ax2.plot(days_list,results_based_on_offline_clf,color='blue',label='Naive Algorithm',marker='o')
+ax2.plot(days_list,results_based_on_our_algorithem,color='red',label='Our Algorithm',marker='o')
+ax2.set_title('Using Deep Neural Network')
+ax2.set_xlabel('Days')
+ax2.set_ylabel('Accuracy')
+ax2.set_xticklabels(days_list)
+ax2.set_yticks(np.arange(0,1.1,0.1))
+ax2.legend()
+plt.show() 
